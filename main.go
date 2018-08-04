@@ -8,6 +8,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -89,6 +91,9 @@ var (
 	})
 
 	pageTmpl = template.Must(template.ParseFiles("./templates/page.tmpl"))
+
+	// coverageMatch regex is used to match and find the coverage details from stdout
+	coverageMatch = regexp.MustCompile("([coverage\\: ][0-9]+[.]?[0-9]*?[%])")
 )
 
 // goversionSupported returns true if the given Go version is supported
@@ -136,12 +141,12 @@ func run(goversion, repo string) (string, string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*300)
 	defer cancel()
 
-	StdOut, StdErr, err := gofn.Run(ctx, buildOpts, &provision.ContainerOptions{})
+	stdOut, stdErr, err := gofn.Run(ctx, buildOpts, &provision.ContainerOptions{})
 	if err != nil {
 		errLogger.Println(err, buildOpts)
 	}
 
-	return StdOut, StdErr, err
+	return stdOut, stdErr, err
 }
 
 // Object struct holds all the details of a repository
@@ -204,45 +209,68 @@ func unsetInProgress(repo, tag string) error {
 	return err
 }
 
+// computeCoverage returns a string with the final computed coverage value
+func computeCoverage(stdOut string) string {
+	nn := coverageMatch.FindAllString(stdOut, -1)
+	total := float64(0.00)
+	count := float64(0.00)
+	for _, n := range nn {
+		n = strings.TrimSpace(n)
+		n = strings.Trim(n, "%")
+		f, err := strconv.ParseFloat(n, 64)
+		if err != nil {
+			continue
+		}
+		total += f
+		count++
+	}
+
+	// to prevent divide by 0
+	if count < 1.0 {
+		count = 1.00
+	}
+	// rounding to 2
+	return fmt.Sprintf("%.2f%%", (total / count))
+}
+
 // cover evaluates the coverage of a repository
 // - Before starting evaluation, it sets the repo's status as in progress
 // - Removes the inprogress status of a repo after it's done
 func cover(repo, goversion string) error {
 	setInProgress(repo, goversion)
 
-	StdOut, StdErr, err := run(goversion, repo)
+	stdOut, stdErr, err := run(goversion, repo)
 	if err != nil {
-		errLogger.Println(err)
-		if len(StdErr) == 0 {
-			StdErr = err.Error()
+		errLogger.Println(err.Error())
+		if len(stdErr) == 0 {
+			stdErr = err.Error()
 		}
 	}
 
-	if len(StdErr) == 0 {
-		switch err {
-		case ErrCovInPrgrs, ErrImgUnSupported, ErrQueued, ErrNoTest:
-			{
-				StdErr = err.Error()
-			}
-		default:
-			{
-				errLogger.Println(err)
-			}
-		}
-	}
+	// if len(StdErr) == 0 {
+	// 	switch err {
+	// 	case ErrCovInPrgrs, ErrImgUnSupported, ErrQueued, ErrNoTest:
+	// 		{
+	// 			StdErr = err.Error()
+	// 		}
+	// 	default:
+	// 		{
+	// 			errLogger.Println(err)
+	// 		}
+	// 	}
+	// }
 
 	unsetInProgress(repo, goversion)
 
 	obj := &Object{
 		Repo:   repo,
 		Tag:    goversion,
-		Cover:  StdErr,
+		Cover:  stdErr,
 		Output: false,
 	}
 
-	stdOut := strings.Trim(StdOut, " \n")
 	if stdOut != "" {
-		obj.Cover = stdOut
+		obj.Cover = computeCoverage(stdOut)
 		obj.Output = true
 	}
 
