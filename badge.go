@@ -167,15 +167,19 @@ func getBadge(color, style, status string) string {
 // coverageBadge returns the SVG badge after computing the coverage
 func coverageBadge(repo, tag, style string) (string, error) {
 	obj, err := repoCover(repo, tag)
-	if err != nil {
-		if err == ErrQueued {
+
+	switch obj.Cover {
+	case ErrQueued.Error():
+		{
 			return getBadge("lightgrey", style, "queued"), nil
 		}
-
-		if err == ErrCovInPrgrs {
+	case ErrCovInPrgrs.Error():
+		{
 			return getBadge("yellowgreen", style, "testing"), nil
 		}
+	}
 
+	if err != nil {
 		errLogger.Println(err)
 	}
 

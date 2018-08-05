@@ -36,6 +36,11 @@ const (
 	// DefaultTag is the Go version to run the tests with when no version
 	// is specified
 	DefaultTag = "1.10"
+	// cacheExpiry is the duration in which the cache will be expired
+	cacheExpiry = time.Hour
+	// refreshWindows is the time duration, in which if the cache is about to expire
+	// cover run is started again.
+	refreshWindow = time.Minute * 10
 )
 
 var (
@@ -151,14 +156,18 @@ func run(goversion, repo string) (string, string, error) {
 
 // Object struct holds all the details of a repository
 type Object struct {
-	Repo   string
-	Tag    string
-	Cover  string
-	Output bool
+	Repo    string
+	Tag     string
+	Cover   string
+	Output  bool
+	AddedAt time.Time
 }
 
 // repoFullName generates a name by combining the Go tag
-func repoFullName(repo, tag string) string {
+func repoFullName(repo, tag string, priority bool) string {
+	if priority {
+		return fmt.Sprintf("%s:%s-priority", repo, tag)
+	}
 	return fmt.Sprintf("%s:%s", repo, tag)
 }
 
@@ -174,26 +183,29 @@ func repoTagFromFullName(msg string) (string, string) {
 // addToQ pushes a new cover run request to the Redis channel
 func addToQ(repo, tag string) error {
 	qLock.Lock()
-	err := redisClient.Publish(coverQName, repoFullName(repo, tag)).Err()
+	err := redisClient.Publish(coverQName, repoFullName(repo, tag, false)).Err()
 	qLock.Unlock()
 	return err
 }
 
 // repoCoverStatus returns true if a repository + tag cover run is in progress
-func repoCoverStatus(repo, tag string) (bool, error) {
+func repoCoverStatus(repo, tag string, priority bool) (bool, error) {
 	// Check if cover run is already in progress for the given repo and tag
-	err := redisRing.HGet(inProgrsKey, repoFullName(repo, tag)).Err()
+	err := redisRing.HGet(inProgrsKey, repoFullName(repo, tag, priority)).Err()
 	if err == nil {
 		return true, nil
 	}
-	errLogger.Println(err)
+	errMsg := err.Error()
+	if errMsg != "redis: nil" {
+		errLogger.Println(errMsg)
+	}
 
 	return false, err
 }
 
 // setInProgress sets the repo + tag as in progress by adding to inPrgorsKey
-func setInProgress(repo, tag string) error {
-	err := redisRing.HSet(inProgrsKey, repoFullName(repo, tag), "y").Err()
+func setInProgress(repo, tag string, priority bool) error {
+	err := redisRing.HSet(inProgrsKey, repoFullName(repo, tag, priority), "y").Err()
 	if err != nil {
 		errLogger.Println(err)
 	}
@@ -201,8 +213,8 @@ func setInProgress(repo, tag string) error {
 }
 
 // unsetInProgress unsets the repo + tag from inprogress status
-func unsetInProgress(repo, tag string) error {
-	err := redisRing.HDel(inProgrsKey, repoFullName(repo, tag)).Err()
+func unsetInProgress(repo, tag string, priority bool) error {
+	err := redisRing.HDel(inProgrsKey, repoFullName(repo, tag, priority)).Err()
 	if err != nil {
 		errLogger.Println(err)
 	}
@@ -210,6 +222,7 @@ func unsetInProgress(repo, tag string) error {
 }
 
 // computeCoverage returns a string with the final computed coverage value
+// Coverage percentages are read from the string output of go coverage
 func computeCoverage(stdOut string) string {
 	nn := coverageMatch.FindAllString(stdOut, -1)
 	total := float64(0.00)
@@ -236,8 +249,8 @@ func computeCoverage(stdOut string) string {
 // cover evaluates the coverage of a repository
 // - Before starting evaluation, it sets the repo's status as in progress
 // - Removes the inprogress status of a repo after it's done
-func cover(repo, goversion string) error {
-	setInProgress(repo, goversion)
+func cover(repo, goversion string, priority bool) error {
+	setInProgress(repo, goversion, priority)
 
 	stdOut, stdErr, err := run(goversion, repo)
 	if err != nil {
@@ -247,26 +260,14 @@ func cover(repo, goversion string) error {
 		}
 	}
 
-	// if len(StdErr) == 0 {
-	// 	switch err {
-	// 	case ErrCovInPrgrs, ErrImgUnSupported, ErrQueued, ErrNoTest:
-	// 		{
-	// 			StdErr = err.Error()
-	// 		}
-	// 	default:
-	// 		{
-	// 			errLogger.Println(err)
-	// 		}
-	// 	}
-	// }
-
-	unsetInProgress(repo, goversion)
+	unsetInProgress(repo, goversion, priority)
 
 	obj := &Object{
-		Repo:   repo,
-		Tag:    goversion,
-		Cover:  stdErr,
-		Output: false,
+		Repo:    repo,
+		Tag:     goversion,
+		Cover:   stdErr,
+		Output:  false,
+		AddedAt: time.Now(),
 	}
 
 	if stdOut != "" {
@@ -275,14 +276,18 @@ func cover(repo, goversion string) error {
 	}
 
 	rerr := redisCodec.Set(&cache.Item{
-		Key:        repoFullName(repo, goversion),
+		Key:        repoFullName(repo, goversion, priority),
 		Object:     obj,
-		Expiration: time.Hour,
+		Expiration: cacheExpiry,
 	})
 	if rerr != nil {
 		errLogger.Println(rerr)
 	}
-	<-qChan
+	// if priority is true, then the request was not pushed to the Q channel,
+	// So cleanup of channel is not required
+	if !priority {
+		<-qChan
+	}
 
 	if err == nil && obj.Cover == "" {
 		return ErrNoTest
@@ -291,10 +296,34 @@ func cover(repo, goversion string) error {
 	return err
 }
 
+// checkAndPush checks if cover can be run simultaneously, if not, then the request is pushed to Q
+func checkAndPush(obj *Object) (*Object, error) {
+	inprogress, err := repoCoverStatus(obj.Repo, obj.Tag, false)
+	if err != nil {
+		errMsg := err.Error()
+		if errMsg != "redis: nil" {
+			errLogger.Println(errMsg)
+		}
+	}
+
+	if inprogress {
+		obj.Cover = ErrCovInPrgrs.Error()
+		return obj, ErrCovInPrgrs
+	}
+	err = addToQ(obj.Repo, obj.Tag)
+	if err != nil {
+		errLogger.Println(err)
+		return obj, ErrUnknown
+	}
+
+	obj.Cover = ErrQueued.Error()
+
+	return obj, ErrQueued
+}
+
 // repoCover returns code coverage details for the given repository and Go version
 // - It checks if the coverage details is available in cache or not
 // - It checks if the cover run is in progress or not
-// - It checks if cover can be run simultaneously, if not request is pushed to Q
 func repoCover(repo, imageTag string) (*Object, error) {
 	obj := &Object{
 		Repo: repo,
@@ -306,30 +335,31 @@ func repoCover(repo, imageTag string) (*Object, error) {
 		return obj, ErrImgUnSupported
 	}
 
-	err := redisCodec.Get(repoFullName(repo, imageTag), &obj)
+	err := redisCodec.Get(repoFullName(repo, imageTag, false), &obj)
 	if err == nil {
+		// Check if repo is about to expire, if yes then start cover run again to refresh cache.
+		// This will help repositories with frequent requests to have the coverage details updated
+		// and available all the time (if re-run is completed on time)
+		now := time.Now()
+		addedAt := obj.AddedAt
+		addedAt = addedAt.Add(cacheExpiry)
+		delta := addedAt.Sub(now)
+		if delta > 0 && delta < refreshWindow {
+			// In case of repos getting frequent checks, the re-run request will not
+			// be queued and will be run immediately as high priority
+			inprogress, _ := repoCoverStatus(obj.Repo, obj.Tag, true)
+			if !inprogress {
+				go cover(obj.Repo, obj.Tag, true)
+			}
+		}
 		return obj, nil
 	}
-	errLogger.Println(err)
-
-	inprogress, err := repoCoverStatus(repo, imageTag)
-	if err != nil {
-		errLogger.Println(err)
-	}
-	if inprogress {
-		obj.Cover = ErrCovInPrgrs.Error()
-		return obj, ErrCovInPrgrs
+	errMsg := err.Error()
+	if errMsg != "cache: key is missing" {
+		errLogger.Println(errMsg)
 	}
 
-	err = addToQ(repo, imageTag)
-	if err != nil {
-		errLogger.Println(err)
-		return obj, ErrUnknown
-	}
-
-	obj.Cover = ErrQueued.Error()
-
-	return obj, ErrQueued
+	return checkAndPush(obj)
 }
 
 type Repository struct {
@@ -372,7 +402,7 @@ func subscribe(qname string) {
 		}
 		repo, tag := repoTagFromFullName(msg.Payload)
 		qChan <- struct{}{}
-		go cover(repo, tag)
+		go cover(repo, tag, false)
 	}
 }
 
