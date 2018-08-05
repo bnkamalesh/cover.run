@@ -27,6 +27,10 @@
 
 		const url = ["", data.Repo + ".svg?style=flat&tag=" + data.Tag + "&d="].join("/");
 		$("#badge").attr("src", url + (new Date()).getTime());
+		if (data.AddedAt) {
+			const d = new Date(data.AddedAt);
+			$("#addedat").text("(last updated: " + d.toLocaleString() + ")");
+		}
 
 		const mdurl = ["https://gocover.run", data.Repo + ".svg?style=flat&tag=" + data.Tag].join("/");
 
