@@ -1,4 +1,6 @@
 (function ($) {
+	// minDateTime is added to filterout dates which are lesser than this while showing last updated.
+	const minDateTime = (new Date("2018/08/01")).getTime();
 	const pollInterval = 3000;
 	let clipboardBind = false;
 
@@ -29,7 +31,9 @@
 		$("#badge").attr("src", url + (new Date()).getTime());
 		if (data.AddedAt) {
 			const d = new Date(data.AddedAt);
-			$("#addedat").text("(last updated: " + d.toLocaleString() + ")");
+			if (d.getTime() > minDateTime) {
+				$("#addedat").text("(last updated: " + d.toLocaleString() + ")");
+			}
 		}
 
 		const mdurl = ["https://gocover.run", data.Repo + ".svg?style=flat&tag=" + data.Tag].join("/");
